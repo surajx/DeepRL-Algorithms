@@ -1,0 +1,4 @@
+{
+    "python.linting.pep8Enabled": false,
+    "python.pythonPath": "/home/surajx/tensorflow/bin/python"
+}
