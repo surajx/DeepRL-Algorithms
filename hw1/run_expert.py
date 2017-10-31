@@ -47,22 +47,24 @@ def init_gym(env_name):
     return env
 
 
-def expert_policy_rollout(env_name, num_rollouts, expert_policy_file,
-                          render=False, max_steps=None, save_filename=None):
-    """Performs rollouts for the expert policy to generate data. Optionally the 
-    generated data is saved. Rollout is a term used interchagenable with 
+def expert_policy_rollout(args):
+    """Performs rollouts for the expert policy to generate data. Optionally the
+    generated data is saved. Rollout is a term used interchagenable with
     trajectory, trial, or history.
 
     Args:
-        env_name: Name of the environment (names recognizable by OpenAI gym)
-        num_rollouts: Number of trials to be performed.
-        render: Optional argument to display the rollouts, defaults to False.
-        max_timestep: Optional argument to set the max timeteps for each rollout
-        save_filename: Optional argument. If provided the generated data 
-            would be saved to file.
+        args: Configuration values from the command line.
     Returns:
-        Dictionaary containing the generated data from the expert.
+        Dictionary containing the generated data from the expert.
     """
+    # Init variables from args
+    env_name = args.envname  # Name of the environment.
+    num_rollouts = args.num_rollouts  # Number of trials to be performed.
+    expert_policy_file = args.expert_policy_file  # Saved expert policy file.
+    render = args.render  # Display agent, defaults to False.
+    max_steps = args.max_timesteps  # Max timeteps for each rollout
+    save_filename = args.save_expert_data  # Filename to store expert data.
+
     # Setup gym environment
     env = init_gym(env_name)
     max_steps = max_steps or env.spec.timestep_limit
@@ -99,17 +101,27 @@ def expert_policy_rollout(env_name, num_rollouts, expert_policy_file,
     print('std of return', np.std(returns))
     expert_data = {'observations': np.array(observations),
                    'actions': np.array(actions)}
-    # TODO: Save expert data to file if enabled.
+    if save_filename:
+        save_expert_data(expert_data, file_name=save_filename)
     return expert_data
 
 
 def load_expert_data(expert_data_file):
-    # TODO: Docstring
-    pass
+    """Loads the exper_data from file"""
+    with open(expert_data_file, 'rb') as f:
+        expert_data = pickle.loads(f.read())
+    return expert_data
 
 
 def get_args():
-    # TODO: Docstring
+    """Parses Command line arguments
+
+    Args:
+        None
+
+    Returns:
+        Namespace object containing arguments and their values.
+    """
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('envname', type=str)  # TODO: help
@@ -127,28 +139,61 @@ def get_args():
     return args
 
 
-def save_expert_data(expert_data, file_name='expert_data', ftype='pkl'):
+def save_expert_data(expert_data, file_name='expert_data.pkl'):
+    """Save generated expert data to file.
+
+    Args:
+        expert_data (dict): generated expert data.
+
+    Returns:
+        None
+    """
+    with open(file_name, 'wb') as f:
+        pickle.dump(expert_data, f)
+
+
+def run_expert(args):
     # TODO: docstring
-    if ftype == 'pkl':
-        pass  # TODO: Implement pickle saving of dict.
-    elif ftype == 'csv':
-        import csv
-        with open(file_name + '.' + ftype, 'w', newline='') as f:
-            csvwriter = csv.writer(f)
-            csvwriter.writerow(expert_data.keys())
-            for i in range(len(expert_data['observations'])):
-                csvwriter.writerow([expert_data[key][i]
-                                    for key in expert_data.keys()])
+    if args.load_expert_data:
+        expert_data = load_expert_data(args.load_expert_data)
+    else:
+        expert_data = expert_policy_rollout(args)
+    return expert_data
+
+
+def gen_input_graph(expert_data):
+    # TODO: docstring
+    # Assume that each row of `observations` corresponds to the same row as `actions`.
+    # Preprocessing
+    def _resize_obs(obs, act):
+        obs_rs = tf.reshape(obs, (1, -1))
+        return obs_rs, act
+    assert expert_data['observations'].shape[0] == expert_data['actions'].shape[0]
+    dataset = tf.contrib.data.Dataset.from_tensor_slices(
+        (expert_data['observations'], expert_data['actions']))
+    dataset = dataset.map(_resize_obs)
+    iterator = dataset.make_one_shot_iterator()
+    return iterator.get_next()
+
+
+def gen_inference_graph(data_tf):
+    # TODO: docstring
+    # Generate inference graph
 
 
 def main():
-    # TODO: docstring
+    """ Entry point for the program.
+    """
     args = get_args()
+    # Build inference graph
+    # Build training graph
     with tf.Session() as sess:
         tf_util.initialize()
-        expert_data = expert_policy_rollout(args.envname, args.num_rollouts, args.expert_policy_file,
-                                            render=args.render, max_steps=args.max_timesteps,
-                                            save_filename=args.save_expert_data)
+        expert_data = run_expert(args)
+        next_data = gen_input_graph(expert_data)
+        for i in range(10):
+            print(sess.run(next_data)[0].shape)
+            print(sess.run(next_data)[1].shape)
 
 
 if __name__ == '__main__':
