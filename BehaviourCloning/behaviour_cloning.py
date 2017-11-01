@@ -1,130 +1,176 @@
-#!/usr/bin/env python
-
 """
-Code to load an expert policy and generate roll-out data for behavioral cloning.
+Code to run behavioral cloning on genererated expert data.
 Example usage:
-    python run_expert.py experts/Humanoid-v1.pkl Humanoid-v1 --render \
-            --num_rollouts 20
+    Create Fresh Data:
+    python behaviour_cloning.py Hopper-v1 \
+    --expert_policy_file experts/Hopper-v1.pkl \
+    --save_expert_data gen_data/expert_data_hopper.pkl \
+    --render --num_rollouts 80
 
-Author of this script and included expert policies: Jonathan Ho (hoj@openai.com)
-Restructured for readability and impl of Behaviour Cloning: Suraj Narayanan Sasikumar
+    Load Saved Data:
+    python behaviour_cloning.py Hopper-v1 \
+        --load_expert_data gen_data/expert_data_hopper.pkl \
+        --render --num_rollouts 80
+
+Implementation of Behaviour Cloning: Suraj Narayanan Sasikumar
 """
 
-import pickle
-import tensorflow as tf
+import util
+import math
 import numpy as np
-import tf_util
-import gym
-import load_policy
+import expert_policy
+import tensorflow as tf
 
 
-def get_expert_policy(expert_policy_file):
-    """Loads the saved expert policy
+class BCPolicy(object):
+    """Create a policy using behviour cloning from expert data."""
 
-    Args:
-        expert_policy_file (str): The file name of the saved expert policy.
+    def __init__(self, oa_dim, max_steps=2000):
+        # TODO: docstring
 
-    Returns:
-        The policy function.
-    """
-    print('Building expert policy...', expert_policy_file)
-    policy_fn = load_policy.load_policy(expert_policy_file)
-    print('Built and Loaded.')
-    return policy_fn
+        # Attributes
+        self.o_dim, self.a_dim = oa_dim
+        self.max_steps = max_steps
 
+        # Constants
+        self.HIDDEN_ARCH = [128, 32]
+        self.beta = 0.01  # Regularization coefficient
 
-def init_gym(env_name):
-    """Initialize environment from gym.
+        # Build Policy Graph
+        self._gen_full_graph()
 
-    Args:
-        env_name (str): Name of the environment to be initialized.
+        # Instantiate Default session
+        self.sess = tf.Session(graph=self.bc_graph)
 
-    Returns:
-        The gym environement object.
-    """
-    import gym
-    env = gym.make(env_name)
-    return env
+        # Intialize all the variables
+        self.sess.run(self.init)
 
+    def _gen_full_graph(self):
+        # TODO: docstring
+        self.bc_graph = tf.Graph()
+        with self.bc_graph.as_default():
+            # Placeholders for obs and act
+            self.obs_ph = tf.placeholder(tf.float32, shape=(1, self.o_dim))
+            self.act_ph = tf.placeholder(tf.float32, shape=(1, self.a_dim))
 
-def expert_policy_rollout(args):
-    """Performs rollouts for the expert policy to generate data. Optionally the
-    generated data is saved. Rollout is a term used interchagenable with
-    trajectory, trial, or history.
+            # Inference graph
+            self.logit = self._inference_graph(self.obs_ph)
 
-    Args:
-        args: Configuration values from the command line.
-    Returns:
-        Dictionary containing the generated data from the expert.
-    """
-    # Init variables from args
-    env_name = args.envname  # Name of the environment.
-    num_rollouts = args.num_rollouts  # Number of trials to be performed.
-    expert_policy_file = args.expert_policy_file  # Saved expert policy file.
-    render = args.render  # Display agent, defaults to False.
-    max_steps = args.max_timesteps  # Max timeteps for each rollout
-    save_filename = args.save_expert_data  # Filename to store expert data.
+            # Loss graph
+            self.loss = self._loss_graph(self.logit, self.act_ph)
 
-    # Setup gym environment
-    env = init_gym(env_name)
-    max_steps = max_steps or env.spec.timestep_limit
-    returns, observations, actions = [], [], []
+            # Train graph
+            self.train_op = self._train_graph(self.loss)
 
-    # Setup expert policy
-    policy_fn = get_expert_policy(expert_policy_file)
+            # Init all variables.
+            self.init = tf.global_variables_initializer()
 
-    # Start rollouts
-    for i in range(num_rollouts):
-        print('Iteration:', i)
-        obs = env.reset()  # Gives the first observation for the current rollout
-        done = False  # bool that tracks the end of rollout.
-        cum_reward = 0.
-        steps = 0
-        # Interact with env until rollout is terminated.
-        while not done:
-            action = policy_fn(obs[None, :])
-            observations.append(obs)
-            actions.append(action)
-            obs, rew, done, _ = env.step(action)  # _ is diagnostic information
-            cum_reward += rew
-            steps += 1
-            if render:
-                env.render()
-            if steps % 100 == 0:
-                print("%i/%i" % (steps, max_steps))
-            if steps >= max_steps:
-                break
-        returns.append(cum_reward)
-    # Return analysis
-    print('returns', returns)
-    print('mean return', np.mean(returns))
-    print('std of return', np.std(returns))
-    expert_data = {'observations': np.array(observations),
-                   'actions': np.array(actions)}
-    if save_filename:
-        save_expert_data(expert_data, file_name=save_filename)
-    return expert_data
+    def _get_W_and_b(self, shape, regularizer=None):
+        # TODO: docstring
+        # Samples from truncated normal are bounded at two stddev to either side
+        # of the mean.
+        # Initialization Justifications:
+        # 1. Random initialization helps break symmetry between learned features.
+        # 2. Bounded values(truncated) help to control the magnitude of the
+        #    gradients, resulting in better convergence.
+        # 3. ReLU adjusted Xavier Initialization [1][2][3][4]
+        #    var[W_i] = \sqrt{2/(number of inputs to neuron)}
+        # [1] https://arxiv.org/pdf/1502.01852.pdf
+        # [2] http://proceedings.mlr.press/v9/glorot10a/glorot10a.pdf
+        # [3] http://andyljones.tumblr.com/post/110998971763/an-explanation-of-xavier-initialization
+        # [4] http://deepdish.io/2015/02/24/network-initialization
+        weights = tf.get_variable("weights", initializer=tf.truncated_normal(
+            shape, stddev=math.sqrt(2.0 / float(shape[0]))),
+            regularizer=regularizer)
+        bias = tf.Variable(tf.zeros([shape[1]]), name="bias")
+        return weights, bias
 
+    def _inference_graph(self, obs):
+        # TODO: docstring
+        # TODO: can't we make this into a loop over HIDDEN_ARCH?
+        regularizer = tf.contrib.layers.l2_regularizer(scale=self.beta)
+        with tf.variable_scope('hidden_layer_1'):
+            weights, bias = self._get_W_and_b(
+                [self.o_dim, self.HIDDEN_ARCH[0]], regularizer)
+            hidden_1_op = tf.nn.relu(tf.matmul(obs, weights) + bias)
+        with tf.variable_scope('hiddel_layer_2'):
+            weights, bias = self._get_W_and_b(
+                [self.HIDDEN_ARCH[0], self.HIDDEN_ARCH[1]], regularizer)
+            hidden_2_op = tf.nn.relu(tf.matmul(hidden_1_op, weights) + bias)
+        with tf.variable_scope('logit_layer'):
+            weights, bias = self._get_W_and_b(
+                [self.HIDDEN_ARCH[1], self.a_dim], regularizer)
+            logit = tf.matmul(hidden_2_op, weights) + bias
+        return logit
 
-def load_expert_data(expert_data_file):
-    """Loads the exper_data from file"""
-    with open(expert_data_file, 'rb') as f:
-        expert_data = pickle.loads(f.read())
-    return expert_data
+    def _loss_graph(self, logit, act):
+        # TODO: docstring
+        loss = tf.losses.mean_squared_error(act, logit)
+        reg_variables = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+        reg_loss = tf.reduce_sum(reg_variables)
+        return loss + reg_loss
+
+    def _train_graph(self, loss):
+        # TODO: docstring
+        optimizer = tf.train.AdamOptimizer(learning_rate=0.01)
+        global_step = tf.Variable(0, name='global_step', trainable=False)
+        train = optimizer.minimize(loss, global_step=global_step)
+        return train
+
+    def _get_data(self, expert_data):
+        # TODO: docstring
+        # Preprocessing
+        def _resize_obs(obs, act):
+            obs_rs = tf.reshape(obs, (1, -1))
+            return obs_rs, act
+
+        # Assume that each row of `observations` corresponds to the
+        # same row as `actions`.
+        assert expert_data['observations'].shape[0] == expert_data['actions'].shape[0]
+        with self.bc_graph.as_default():
+            dataset = tf.contrib.data.Dataset.from_tensor_slices(
+                (expert_data['observations'], expert_data['actions']))
+            dataset = dataset.map(_resize_obs)
+            dataset = dataset.repeat()
+            iterator = dataset.make_one_shot_iterator()
+            nxt_obs, nxt_act = iterator.get_next()
+        return nxt_obs, nxt_act
+
+    def train(self, expert_data):
+        # TODO: docstring
+        nxt_obs, nxt_act = self._get_data(expert_data)
+        for step in range(self.max_steps):
+            obs = self.sess.run(nxt_obs)
+            act = self.sess.run(nxt_act)
+            feed_dict = {
+                self.obs_ph: obs,
+                self.act_ph: act
+            }
+            _, loss_value, logit_value = self.sess.run(
+                [self.train_op, self.loss, self.logit], feed_dict=feed_dict)
+            if step % 500 == 0:
+                print('Step %d: loss = %.2f' % (step, loss_value))
+
+    def sample(self, obs):
+        # TODO: docstring
+        feed_dict = {
+            self.obs_ph: obs
+        }
+        return self.sess.run(self.logit, feed_dict=feed_dict)
 
 
 def get_args():
     """Parses Command line arguments
-
-    Args:
-        None
 
     Returns:
         Namespace object containing arguments and their values.
     """
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('envname', type=str)  # TODO: help
+    parser.add_argument('env_name', type=str)  # TODO: help
+    # parser.add_argument('--bc-hidden-layers', nargs='+', type=int,
+    #                     help="Hidden layer structure Ex: --hidden-layers 128 64 32")
+    # parser.add_argument('--bc-learning-rate', type=float)  # TODO: help
     parser.add_argument('--expert_policy_file', type=str,
                         help='Expert Policy to load and perform rollout.')
     parser.add_argument('--save_expert_data', type=str,
@@ -139,61 +185,45 @@ def get_args():
     return args
 
 
-def save_expert_data(expert_data, file_name='expert_data.pkl'):
-    """Save generated expert data to file.
+def rollout_policy(policy, env, args):
+    max_steps = env.spec.timestep_limit
+    returns, observations, actions = [], [], []
 
-    Args:
-        expert_data (dict): generated expert data.
-
-    Returns:
-        None
-    """
-    with open(file_name, 'wb') as f:
-        pickle.dump(expert_data, f)
-
-
-def run_expert(args):
-    # TODO: docstring
-    if args.load_expert_data:
-        expert_data = load_expert_data(args.load_expert_data)
-    else:
-        expert_data = expert_policy_rollout(args)
-    return expert_data
-
-
-def gen_input_graph(expert_data):
-    # TODO: docstring
-    # Assume that each row of `observations` corresponds to the same row as `actions`.
-    # Preprocessing
-    def _resize_obs(obs, act):
-        obs_rs = tf.reshape(obs, (1, -1))
-        return obs_rs, act
-    assert expert_data['observations'].shape[0] == expert_data['actions'].shape[0]
-    dataset = tf.contrib.data.Dataset.from_tensor_slices(
-        (expert_data['observations'], expert_data['actions']))
-    dataset = dataset.map(_resize_obs)
-    iterator = dataset.make_one_shot_iterator()
-    return iterator.get_next()
-
-
-def gen_inference_graph(data_tf):
-    # TODO: docstring
-    # Generate inference graph
+    # Start rollouts
+    for i in range(args.num_rollouts):
+        print('Iteration:', i)
+        obs = env.reset()  # First observation for the current rollout
+        done = False  # bool that tracks the end of rollout.
+        cum_reward = 0.
+        steps = 0
+        # Interact with env until rollout is terminated.
+        while not done:
+            action = policy.sample(obs[None, :])
+            observations.append(obs)
+            actions.append(action)
+            obs, rew, done, _ = env.step(action)  # _ is diagnostic information
+            cum_reward += rew
+            steps += 1
+            if args.render:
+                env.render()
+            if steps % 100 == 0:
+                print("%i/%i" % (steps, max_steps))
+            if steps >= max_steps:
+                break
+        returns.append(cum_reward)
+    # Return analysis
+    print('returns', returns)
+    print('mean return', np.mean(returns))
+    print('std of return', np.std(returns))
 
 
 def main():
-    """ Entry point for the program.
-    """
-    args = get_args()
-    # Build inference graph
-    # Build training graph
-    with tf.Session() as sess:
-        tf_util.initialize()
-        expert_data = run_expert(args)
-        next_data = gen_input_graph(expert_data)
-        for i in range(10):
-            print(sess.run(next_data)[0].shape)
-            print(sess.run(next_data)[1].shape)
+    args = get_args()  # Get commandline arguments.
+    expert_data = expert_policy.get_expert_data(args)  # Generate expert data.
+    env, oa_dim = util.get_env(args.env_name)
+    policy = BCPolicy(oa_dim, max_steps=50000)  # Untrained policy pi(a|o)
+    policy.train(expert_data)  # Train policy using Behaviour Cloning
+    rollout_policy(policy, env, args)
 
 
 if __name__ == '__main__':
