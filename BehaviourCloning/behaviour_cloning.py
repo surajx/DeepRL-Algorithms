@@ -146,9 +146,9 @@ class BCPolicy(object):
                 self.obs_ph: obs,
                 self.act_ph: act
             }
-            _, loss_value, logit_value = self.sess.run(
-                [self.train_op, self.loss, self.logit], feed_dict=feed_dict)
-            if step % 500 == 0:
+            _, loss_value = self.sess.run(
+                [self.train_op, self.loss], feed_dict=feed_dict)
+            if step % 100 == 0:
                 print('Step %d: loss = %.2f' % (step, loss_value))
 
     def sample(self, obs):
